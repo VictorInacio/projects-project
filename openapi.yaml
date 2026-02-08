@@ -1,0 +1,292 @@
+openapi: 3.1.1
+info:
+  title: Projects API
+  description: |
+    A simple Projects service for managing project entities.
+
+    ## Versioning
+    API is versioned via URL path prefix (e.g., `/v1/projects`).
+    This approach is explicit, cacheable, and easy to evolve.
+
+    ## Pagination
+    List endpoints use limit/offset pagination with sensible defaults.
+    - `limit`: 1-100 (default: 20)
+    - `offset`: >= 0 (default: 0)
+    - `sort`: field name, prefix with `-` for descending
+
+    ## Error Handling
+    All errors return a consistent JSON structure with:
+    - `error`: machine-readable error code
+    - `message`: human-readable description
+    - `details`: (optional) array of field-level errors
+  version: "1.0.0"
+  contact:
+    name: API Support
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      tags: [system]
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+
+  /v1/projects:
+    get:
+      summary: List all projects
+      operationId: listProjects
+      tags: [projects]
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of items to return (1-100)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          description: Number of items to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: sort
+          in: query
+          description: |
+            Sort field. Prefix with `-` for descending order.
+            Valid values: `created_at`, `-created_at`, `name`, `-name`
+          schema:
+            type: string
+            enum: [created_at, -created_at, name, -name]
+            default: "-created_at"
+      responses:
+        "200":
+          description: Paginated list of projects
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedProjects"
+
+    post:
+      summary: Create a new project
+      operationId: createProject
+      tags: [projects]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectCreate"
+            examples:
+              minimal:
+                summary: Minimal project
+                value:
+                  name: "New Project"
+              withStatus:
+                summary: Project with status
+                value:
+                  name: "On Hold Project"
+                  status: "on-hold"
+      responses:
+        "201":
+          description: Project created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "validation_error"
+                message: "Invalid request body"
+                details:
+                  - field: "name"
+                    message: "should be at least 1 character"
+        "409":
+          description: ID conflict (extremely rare with UUIDs)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/projects/{id}:
+    get:
+      summary: Get a project by ID
+      operationId: getProject
+      tags: [projects]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Project UUID
+          schema:
+            type: string
+            format: uuid
+            example: "550e8400-e29b-41d4-a716-446655440001"
+      responses:
+        "200":
+          description: Project found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "404":
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "not_found"
+                message: "Project with id '550e8400-e29b-41d4-a716-446655440001' not found"
+
+components:
+  schemas:
+    Project:
+      type: object
+      description: A project entity
+      required:
+        - id
+        - name
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier (UUID v4)
+          example: "550e8400-e29b-41d4-a716-446655440001"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Human-readable project name
+          example: "Website Redesign"
+        status:
+          type: string
+          enum: [active, on-hold, archived]
+          description: |
+            Project lifecycle status:
+            - `active`: ongoing project (default)
+            - `on-hold`: temporarily paused
+            - `archived`: terminal state, project complete or cancelled
+          example: "active"
+        created_at:
+          type: string
+          format: date-time
+          description: Server timestamp when project was created
+          example: "2024-01-15T10:30:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          description: Server timestamp when project was last modified
+          example: "2024-01-15T10:30:00Z"
+
+    ProjectCreate:
+      type: object
+      description: Request body for creating a project
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Human-readable project name (will be trimmed)
+          example: "New Project"
+        status:
+          type: string
+          enum: [active, on-hold, archived]
+          description: Initial project status (defaults to "active")
+          default: "active"
+
+    PaginatedProjects:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        pagination:
+          type: object
+          required:
+            - total
+            - limit
+            - offset
+          properties:
+            total:
+              type: integer
+              description: Total number of projects
+              example: 42
+            limit:
+              type: integer
+              description: Page size used
+              example: 20
+            offset:
+              type: integer
+              description: Number of items skipped
+              example: 0
+
+    Error:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code
+          enum:
+            - validation_error
+            - not_found
+            - conflict
+            - internal_error
+          example: "validation_error"
+        message:
+          type: string
+          description: Human-readable error description
+          example: "Invalid request body"
+        details:
+          type: array
+          description: Field-level error details (for validation errors)
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+                description: Name of the invalid field
+                example: "name"
+              message:
+                type: string
+                description: Error message for this field
+                example: "should be at least 1 character"
+
+tags:
+  - name: projects
+    description: Project management endpoints
+  - name: system
+    description: System health and status endpoints
