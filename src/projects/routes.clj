@@ -13,6 +13,7 @@
             [reitit.ring.middleware.parameters :as parameters]
             [reitit.ring.middleware.exception :as exception]
             [reitit.ring.middleware.muuntaja :as muuntaja]
+            [reitit.swagger-ui :as swagger-ui]
             [muuntaja.core :as m]
             [projects.handlers :as h]
             [projects.schema :as schema]
@@ -65,10 +66,20 @@
 ;; Route definitions
 ;; -----------------------------------------------------------------------------
 
+(def ^:private openapi-spec
+  "OpenAPI spec loaded once at require time."
+  (slurp "openapi.yaml"))
+
 (defn api-routes
   "Build API routes with component injection."
   [components]
-  [["/health"
+  [["/openapi.yaml"
+    {:get {:handler (constantly {:status 200
+                                 :headers {"Content-Type" "application/yaml"}
+                                 :body openapi-spec})
+           :no-doc true}}]
+
+   ["/health"
     {:get {:handler (partial h/health components)
            :summary "Health check"
            :responses {200 {:body [:map [:status :string]]}}}}]
@@ -126,7 +137,12 @@
   [components]
   (ring/ring-handler
    (create-router components)
-   (ring/create-default-handler
-    {:not-found (constantly {:status 404
-                             :headers {"Content-Type" "application/json"}
-                             :body "{\"error\":\"not_found\",\"message\":\"Endpoint not found\"}"})})))
+   (ring/routes
+    (swagger-ui/create-swagger-ui-handler
+     {:path "/swagger"
+      :url "/openapi.yaml"
+      :config {:validatorUrl nil}})
+    (ring/create-default-handler
+     {:not-found (constantly {:status 404
+                              :headers {"Content-Type" "application/json"}
+                              :body "{\"error\":\"not_found\",\"message\":\"Endpoint not found\"}"})}))))
