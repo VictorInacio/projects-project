@@ -1,3 +1,4 @@
+### Clojure / Leiningen ###
 pom.xml
 pom.xml.asc
 *.jar
@@ -12,3 +13,22 @@ pom.xml.asc
 .lein-failures
 .nrepl-port
 .cpcache/
+
+### Terraform ###
+/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+### IDE ###
+.idea/
+
+### OS ###
+.DS_Store
