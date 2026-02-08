@@ -8,6 +8,8 @@ POST /v1/projects      Create a project
 GET  /v1/projects/{id} Fetch a single project
 ```
 
+Browse the API interactively at [http://localhost:3000/swagger](http://localhost:3000/swagger) (Swagger UI).
+
 See [`DESIGN.md`](./DESIGN.md) for architecture, design decisions, and rationale.
 See [`openapi.yaml`](./openapi.yaml) for the full API contract (OpenAPI 3.1.1).
 
@@ -17,7 +19,7 @@ See [`openapi.yaml`](./openapi.yaml) for the full API contract (OpenAPI 3.1.1).
 
 ```bash
 clj -M:run                          # start the server
-clj -M:test                         # run tests (16 tests, 77 assertions)
+clj -M:test                         # run tests (19 tests, 106 assertions)
 ```
 
 The server starts at **http://localhost:3000** with a SQLite database and seed data created automatically.

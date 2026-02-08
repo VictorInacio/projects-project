@@ -137,7 +137,9 @@ Error codes: `validation_error` (400), `not_found` (404), `conflict` (409), `int
 
 ### OpenAPI Spec
 
-See [openapi.yaml](./openapi.yaml) for the complete specification.
+See [openapi.yaml](./openapi.yaml) for the complete specification, or browse it interactively at [/swagger](http://localhost:3000/swagger) when the server is running.
+
+The spec is served as a static file (`/openapi.yaml`) and rendered via `reitit-swagger-ui`. This keeps the hand-written OpenAPI document as the single source of truth rather than generating it from route metadata.
 
 ---
 
@@ -274,7 +276,7 @@ The REPL `(reset)` reloads code and restarts all components cleanly, providing f
 2. **Integration tests** (`api_test.clj`) - Full HTTP request cycle through Ring mock
 3. **Schema coercion in tests** - Every response body validated against the same Malli schemas used at runtime
 4. **In-memory SQLite** - Fresh database per test, fast, isolated, no cleanup
-5. **Edge cases** - Unicode names, whitespace trimming, 409 conflict via `with-redefs`
+5. **Edge cases** - Unicode names, whitespace trimming, boundary lengths, closed-map key stripping, roundtrip consistency, 409 conflict via `with-redefs`
 
 ### Security Considerations
 
@@ -321,24 +323,59 @@ cd terraform && terraform init && terraform validate
 
 ## 7. AI Usage
 
-This solution was developed with Claude Code assistance. Verification approach:
+This solution was developed iteratively with Claude Code (CLI). Below are the prompts that materially shaped the implementation and the specific verifications performed on AI-generated output.
 
-1. **Schema validation** - Tested all Malli schemas with edge cases in `schema_test.clj`
-2. **API testing** - 16 integration tests covering happy paths, validation errors, 404, and 409 conflict
-3. **Schema coercion in tests** - Every test asserts response bodies conform to Malli schemas, ensuring runtime and test-time contracts match
-4. **Manual testing** - curl commands to verify actual HTTP behavior end-to-end
-5. **Code review** - Read all generated code, understood each decision, fixed issues (e.g., Muuntaja encoding bug where manually set Content-Type headers prevented JSON serialization)
-6. **Terraform validation** - `terraform validate` passes
+### Prompts That Influenced the Solution
 
-### Key Verifications Made
+**1. Initial scaffolding** — *"Build a Projects API in Clojure with Reitit, Malli, and SQLite"*
 
-- Confirmed Malli schema syntax for closed maps (`:closed true`)
-- Verified Reitit coercion middleware ordering (negotiate -> format-response -> exception -> format-request -> coerce)
-- Fixed Muuntaja integration: removed manual `Content-Type` headers from handlers that prevented JSON encoding
-- Fixed coercion error serialization: converted raw Malli error objects to JSON-safe `{:field :message}` maps
-- Tested SQLite WAL mode configuration for concurrent reads
-- Validated HikariCP settings for SQLite (small pool, init SQL for pragmas)
-- Reviewed Terraform Snowflake provider resources and grant permissions
+Claude generated the project structure (`core.clj`, `config.clj`, `system.clj`, `db.clj`, `schema.clj`, `handlers.clj`, `routes.clj`), Integrant wiring, HikariCP setup, Malli schemas, and a first pass at handlers. This gave a working skeleton that I then tested, debugged, and refined.
+
+**2. Muuntaja bug discovery** — *"After running throws exception: `IllegalArgumentException: No implementation of method: :write-body-to-stream`"*
+
+The initial AI-generated handlers set `Content-Type: application/json` manually. This told Muuntaja the body was already formatted, so it skipped JSON encoding — Ring then received raw Clojure maps and threw. **Fix:** Removed manual `Content-Type` headers from `handlers.clj` and `routes.clj`. This also exposed a second bug: the coercion error handler passed raw Malli error objects (non-serializable) as response details. **Fix:** Converted errors to plain `[{:field "name", :message "..."}]` maps.
+
+**Verification:** The test suite had silently passed before the fix because `parse-body` in tests had a `(map? body)` branch that accepted raw Clojure maps, bypassing JSON encoding entirely. After the fix, responses go through full Muuntaja encoding/decoding, which is the actual production path.
+
+**3. Schema coercion in tests** — *"Use coercion of the schemas on the tests and mention how it works"*
+
+Added `(is (conforms? schema/Project body))` assertions to every test case, making Malli schemas the **single source of truth** shared between runtime middleware and test assertions. If a handler returns a field with the wrong type or omits a required key, both the runtime middleware and the test suite catch it.
+
+**4. Status code coverage** — *"Check if server implements status codes for invalid input, not found, and conflicts"*
+
+Discovered that 409 (conflict) was implemented in the handler but had **zero test coverage**. The handler called `(str (UUID/randomUUID))` inline, making it impossible to force a collision. **Fix:** Extracted `generate-id` as a public function, then tested 409 via `with-redefs`:
+
+```clojure
+(with-redefs [h/generate-id (constantly existing-id)]
+  (let [{:keys [status]} (api-call :post "/v1/projects" {:name "Collider"})]
+    (is (= 409 status))))
+```
+
+**5. Document restructuring** — *"Make a cleanup README with a TLDR session and move to DESIGN.md all that is explanation"*
+
+Separated operational documentation (README, 130 lines) from design rationale (this document) per the challenge deliverable template, ensuring both files serve distinct audiences.
+
+**6. Swagger UI** — *"Add an OpenAPI viewer endpoint with the default tool for that"*
+
+Added `reitit-swagger-ui` to serve the hand-written `openapi.yaml` at `/swagger`. The spec is loaded once at startup via `slurp` and served as a static file, keeping the hand-written document as the single source of truth rather than generating it from route metadata.
+
+### How AI Output Was Verified
+
+| Verification | Method | What it caught |
+|-------------|--------|----------------|
+| **Unit tests** | `schema_test.clj` — 15 assertions on Malli validation rules | Whitespace trimming, boundary lengths, closed map behavior |
+| **Integration tests** | `api_test.clj` — full HTTP cycle through Ring mock | Muuntaja encoding bug, coercion error serialization bug |
+| **Schema coercion** | Every test asserts `(conforms? schema/... body)` | Ensures runtime and test-time contracts match |
+| **Manual curl testing** | All endpoints tested end-to-end with the running server | Shell quoting issues (`&` in URLs), actual JSON output verification |
+| **Code review** | Read all generated code, understood each decision | Identified Muuntaja/Content-Type conflict, non-serializable Malli errors |
+| **Terraform validate** | `terraform init && terraform validate` | Syntax and provider configuration |
+
+### Key Bugs Found and Fixed in AI Output
+
+1. **Muuntaja Content-Type conflict** — AI set `Content-Type: application/json` in handlers, preventing Muuntaja from encoding response bodies. Removed manual headers.
+2. **Non-serializable error details** — Coercion exception handler passed raw Malli schema objects. Converted to plain `{:field :message}` maps.
+3. **Untestable UUID generation** — `(str (UUID/randomUUID))` was inline in handler. Extracted to `generate-id` function for `with-redefs` testing.
+4. **Silent test pass on broken encoding** — Test helper accepted raw maps via `(map? body)` branch, masking the Muuntaja bug. Fixed by ensuring responses go through full encoding.
 
 ---
 
@@ -384,7 +421,7 @@ clj -M:test
 # With verbose output
 clj -M:test --reporter documentation
 
-# 16 tests, 77 assertions, 0 failures
+# 19 tests, 106 assertions, 0 failures
 ```
 
 ### Terraform Validation
