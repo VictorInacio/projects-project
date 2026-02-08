@@ -16,10 +16,9 @@
 ;; -----------------------------------------------------------------------------
 
 (defn- json-response
-  "Build a Ring response with JSON content type."
+  "Build a Ring response. Muuntaja handles JSON encoding and Content-Type."
   [status body]
   {:status status
-   :headers {"Content-Type" "application/json"}
    :body body})
 
 (defn- error-response
@@ -39,6 +38,15 @@
      (into acc (map (fn [msg] {:field (name field) :message msg}) msgs)))
    []
    errors))
+
+;; -----------------------------------------------------------------------------
+;; ID generation
+;; -----------------------------------------------------------------------------
+
+(defn generate-id
+  "Generate a new UUID v4 string. Extracted for testability (with-redefs)."
+  []
+  (str (UUID/randomUUID)))
 
 ;; -----------------------------------------------------------------------------
 ;; Handlers
@@ -94,7 +102,7 @@
       ;; Valid - create project
       (let [data (:ok validation)
             now (str (java.time.Instant/now))
-            project {:id (str (UUID/randomUUID))
+            project {:id (generate-id)
                      :name (:name data)
                      :status (or (:status data) "active")
                      :created_at now

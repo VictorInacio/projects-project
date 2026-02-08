@@ -28,7 +28,6 @@
   (fn [exception _request]
     (log/error exception message)
     {:status status
-     :headers {"Content-Type" "application/json"}
      :body {:error (if (= status 500) "internal_error" "request_error")
             :message message}}))
 
@@ -40,11 +39,19 @@
     {;; Coercion/validation errors -> 400
      :reitit.coercion/request-coercion
      (fn [ex _]
-       {:status 400
-        :headers {"Content-Type" "application/json"}
-        :body {:error "validation_error"
-               :message "Invalid request parameters"
-               :details (-> ex ex-data :errors)}})
+       (let [errors (-> ex ex-data :errors)
+             details (when (map? errors)
+                       (into []
+                             (mapcat (fn [[k v]]
+                                       (map (fn [msg]
+                                              {:field (name k)
+                                               :message (str msg)})
+                                            (if (sequential? v) v [v]))))
+                             errors))]
+         {:status 400
+          :body (cond-> {:error "validation_error"
+                         :message "Invalid request parameters"}
+                  (seq details) (assoc :details details))}))
 
      ;; Malformed JSON -> 400
      ::exception/default
