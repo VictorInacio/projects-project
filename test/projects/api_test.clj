@@ -1,9 +1,14 @@
 (ns projects.api-test
   "Integration tests for the Projects API endpoints.
-   Uses an in-memory SQLite database for isolation."
+   Uses an in-memory SQLite database for isolation.
+   Response bodies are validated against Malli schemas to ensure
+   the API contract is enforced end-to-end."
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
+            [malli.core :as m]
             [projects.db :as db]
+            [projects.handlers :as h]
             [projects.routes :as routes]
+            [projects.schema :as schema]
             [ring.mock.request :as mock]
             [clojure.data.json :as json]))
 
@@ -71,6 +76,12 @@
      {:status (:status response)
       :body (parse-body response)})))
 
+(defn- conforms?
+  "Assert that data validates against a Malli schema.
+   Returns true/false; use inside (is ...) for clear test output."
+  [malli-schema data]
+  (m/validate malli-schema data))
+
 ;; -----------------------------------------------------------------------------
 ;; Health endpoint tests
 ;; -----------------------------------------------------------------------------
@@ -90,40 +101,55 @@
     (let [{:keys [status body]} (api-call :post "/v1/projects"
                                           {:name "Test Project"})]
       (is (= 201 status))
-      (is (string? (:id body)))
-      (is (= 36 (count (:id body))))  ; UUID format
+      (is (conforms? schema/Project body) "response must match Project schema")
       (is (= "Test Project" (:name body)))
-      (is (= "active" (:status body)))  ; Default status
-      (is (string? (:created_at body)))
-      (is (string? (:updated_at body))))))
+      (is (= "active" (:status body))))))
 
 (deftest create-project-with-status
   (testing "POST /v1/projects accepts custom status"
     (let [{:keys [status body]} (api-call :post "/v1/projects"
                                           {:name "Archived" :status "archived"})]
       (is (= 201 status))
+      (is (conforms? schema/Project body) "response must match Project schema")
       (is (= "archived" (:status body))))))
 
 (deftest create-project-validation-errors
   (testing "rejects empty name"
     (let [{:keys [status body]} (api-call :post "/v1/projects" {:name ""})]
       (is (= 400 status))
+      (is (conforms? schema/ErrorResponse body) "error must match ErrorResponse schema")
       (is (= "validation_error" (:error body)))))
 
   (testing "rejects missing name"
     (let [{:keys [status body]} (api-call :post "/v1/projects" {})]
       (is (= 400 status))
+      (is (conforms? schema/ErrorResponse body) "error must match ErrorResponse schema")
       (is (= "validation_error" (:error body)))))
 
   (testing "rejects invalid status"
     (let [{:keys [status body]} (api-call :post "/v1/projects"
                                           {:name "Test" :status "invalid"})]
-      (is (= 400 status))))
+      (is (= 400 status))
+      (is (conforms? schema/ErrorResponse body) "error must match ErrorResponse schema")))
 
   (testing "rejects name over 200 chars"
     (let [long-name (apply str (repeat 201 "a"))
-          {:keys [status]} (api-call :post "/v1/projects" {:name long-name})]
-      (is (= 400 status)))))
+          {:keys [status body]} (api-call :post "/v1/projects" {:name long-name})]
+      (is (= 400 status))
+      (is (conforms? schema/ErrorResponse body) "error must match ErrorResponse schema"))))
+
+(deftest create-project-conflict
+  (testing "409 when generated UUID collides with existing project"
+    ;; Create a project and capture its ID
+    (let [{:keys [body]} (api-call :post "/v1/projects" {:name "First"})
+          existing-id (:id body)]
+      ;; Force the next create to generate the same UUID
+      (with-redefs [h/generate-id (constantly existing-id)]
+        (let [{:keys [status body]} (api-call :post "/v1/projects"
+                                              {:name "Collider"})]
+          (is (= 409 status))
+          (is (conforms? schema/ErrorResponse body) "error must match ErrorResponse schema")
+          (is (= "conflict" (:error body))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Get project tests
@@ -138,6 +164,7 @@
           ;; Then fetch it
           {:keys [status body]} (api-call :get (str "/v1/projects/" id))]
       (is (= 200 status))
+      (is (conforms? schema/Project body) "response must match Project schema")
       (is (= id (:id body)))
       (is (= "Fetch Me" (:name body))))))
 
@@ -145,6 +172,7 @@
   (testing "GET /v1/projects/:id returns 404 for unknown ID"
     (let [{:keys [status body]} (api-call :get "/v1/projects/00000000-0000-0000-0000-000000000000")]
       (is (= 404 status))
+      (is (conforms? schema/ErrorResponse body) "error must match ErrorResponse schema")
       (is (= "not_found" (:error body))))))
 
 ;; -----------------------------------------------------------------------------
@@ -155,6 +183,7 @@
   (testing "GET /v1/projects returns empty list initially"
     (let [{:keys [status body]} (api-call :get "/v1/projects")]
       (is (= 200 status))
+      (is (conforms? schema/PaginatedResponse body) "response must match PaginatedResponse schema")
       (is (= [] (:data body)))
       (is (= 0 (get-in body [:pagination :total]))))))
 
@@ -166,6 +195,7 @@
 
     (let [{:keys [status body]} (api-call :get "/v1/projects")]
       (is (= 200 status))
+      (is (conforms? schema/PaginatedResponse body) "response must match PaginatedResponse schema")
       (is (= 2 (count (:data body))))
       (is (= 2 (get-in body [:pagination :total]))))))
 
@@ -177,6 +207,7 @@
 
     ;; Get first page
     (let [{body :body} (api-call :get "/v1/projects?limit=2&offset=0")]
+      (is (conforms? schema/PaginatedResponse body) "response must match PaginatedResponse schema")
       (is (= 2 (count (:data body))))
       (is (= 5 (get-in body [:pagination :total])))
       (is (= 2 (get-in body [:pagination :limit])))
@@ -184,6 +215,7 @@
 
     ;; Get second page
     (let [{body :body} (api-call :get "/v1/projects?limit=2&offset=2")]
+      (is (conforms? schema/PaginatedResponse body) "response must match PaginatedResponse schema")
       (is (= 2 (count (:data body))))
       (is (= 2 (get-in body [:pagination :offset]))))))
 
@@ -192,9 +224,10 @@
     (api-call :post "/v1/projects" {:name "Zebra"})
     (api-call :post "/v1/projects" {:name "Apple"})
 
-    (let [{body :body} (api-call :get "/v1/projects?sort=name")
-          names (map :name (:data body))]
-      (is (= ["Apple" "Zebra"] names)))))
+    (let [{body :body} (api-call :get "/v1/projects?sort=name")]
+      (is (conforms? schema/PaginatedResponse body) "response must match PaginatedResponse schema")
+      (let [names (map :name (:data body))]
+        (is (= ["Apple" "Zebra"] names))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Edge case tests
@@ -205,6 +238,7 @@
     (let [{:keys [status body]} (api-call :post "/v1/projects"
                                           {:name "Proyecto España 日本語"})]
       (is (= 201 status))
+      (is (conforms? schema/Project body) "response must match Project schema")
       (is (= "Proyecto España 日本語" (:name body))))))
 
 (deftest whitespace-handling
@@ -212,6 +246,7 @@
     (let [{:keys [status body]} (api-call :post "/v1/projects"
                                           {:name "  Trimmed Name  "})]
       (is (= 201 status))
+      (is (conforms? schema/Project body) "response must match Project schema")
       (is (= "Trimmed Name" (:name body))))))
 
 (deftest not-found-endpoint

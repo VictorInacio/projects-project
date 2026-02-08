@@ -5,20 +5,22 @@
 ### Acceptance Criteria
 
 **Functional:**
-- `GET /v1/projects` — List projects with pagination (limit/offset) and sorting
-- `POST /v1/projects` — Create a project with validated name, optional status
-- `GET /v1/projects/{id}` — Fetch a single project by UUID
+- `GET /v1/projects` - List projects with pagination (limit/offset) and sorting
+- `POST /v1/projects` - Create a project with validated name, optional status
+- `GET /v1/projects/{id}` - Fetch a single project by UUID
 - All responses return consistent JSON format
 - Validation errors return 400 with detailed field errors
 - Not found returns 404 with meaningful message
+- ID collisions return 409
 
 **Non-Functional:**
 - SQLite file-based database for local development
 - Connection pooling via HikariCP
-- Clean startup/shutdown lifecycle
-- API versioning via URL path
+- Clean startup/shutdown lifecycle via Integrant
+- API versioning via URL path prefix
 - OpenAPI 3.1.1 specification
-- Malli schemas for request/response validation
+- Malli schemas for request and response validation
+- Malli schema coercion verified in integration tests
 
 ### Out of Scope
 - Authentication/authorization
@@ -28,14 +30,17 @@
 - Production deployment configuration
 - CI/CD pipeline
 
-### Open Questions Resolved
+### Ambiguities Resolved
+
 | Question | Decision |
 |----------|----------|
-| Pagination style? | Limit/offset — simple, sufficient for expected data sizes |
-| ID type? | UUID v4 string — no coordination, URL-safe, works with SQLite |
+| Pagination style? | Limit/offset - simple, sufficient for expected data sizes |
+| ID type? | UUID v4 string - no coordination, URL-safe, works with SQLite |
 | Default page size? | 20 items (configurable via env) |
 | Name validation? | 1-200 chars, trimmed, allows unicode |
 | Status values? | `active` (default), `on-hold`, `archived` (terminal) |
+| Error payloads? | RFC 7807-style: `error` code + `message` + optional `details` |
+| 400 vs 422? | 400 for all input errors (simpler, widely understood) |
 
 ---
 
@@ -62,11 +67,11 @@ cheap to store and expensive to retrofit later.
 - Works well with SQLite (stored as TEXT, simple string comparison)
 - URL-safe without encoding
 - Collision probability negligible (2^122 space)
-- Portable across databases (SQLite dev → Snowflake prod)
+- Portable across databases (SQLite dev -> Snowflake prod)
 
 **Trade-offs:**
-- Larger than integers (36 bytes vs 4-8 bytes) — acceptable for this scale
-- Not sortable by creation order — use `created_at` index instead
+- Larger than integers (36 bytes vs 4-8 bytes) - acceptable for this scale
+- Not sortable by creation order - use `created_at` index instead
 
 ### SQLite Choice
 
@@ -80,7 +85,7 @@ cheap to store and expensive to retrofit later.
 
 ## 3. API Contract
 
-### Endpoints Summary
+### Endpoints
 
 | Method | Path | Description | Status Codes |
 |--------|------|-------------|--------------|
@@ -89,22 +94,32 @@ cheap to store and expensive to retrofit later.
 | POST | /v1/projects | Create project | 201, 400, 409 |
 | GET | /v1/projects/{id} | Get project | 200, 404 |
 
+### Status Codes
+
+| Code | Meaning | When | Source |
+|------|---------|------|--------|
+| **200** | OK | Successful GET | `handlers.clj` |
+| **201** | Created | Successful POST | `handlers.clj` |
+| **400** | Bad Request | Missing/invalid fields, malformed JSON | Reitit coercion middleware + handler validation |
+| **404** | Not Found | Unknown project ID or unknown endpoint | `handlers.clj` + default handler in `routes.clj` |
+| **409** | Conflict | UUID collision on create (extremely rare) | `handlers.clj` |
+| **500** | Internal Error | Unexpected exceptions | Exception middleware in `routes.clj` |
+
+All error codes are covered by integration tests, including 409 which is tested by forcing a UUID collision via `with-redefs`.
+
 ### Error Model
 
-All errors return:
+All errors return a consistent JSON envelope:
+
 ```json
 {
-  "error": "error_code",
+  "error": "validation_error",
   "message": "Human readable message",
   "details": [{"field": "name", "message": "specific error"}]
 }
 ```
 
-**Error Codes:**
-- `validation_error` (400) — Invalid request body/params
-- `not_found` (404) — Resource doesn't exist
-- `conflict` (409) — ID collision (extremely rare)
-- `internal_error` (500) — Unexpected server error
+Error codes: `validation_error` (400), `not_found` (404), `conflict` (409), `internal_error` (500).
 
 ### Versioning Strategy: URL Path Prefix
 
@@ -122,11 +137,47 @@ All errors return:
 
 ### OpenAPI Spec
 
-See [openapi.yaml](./openapi.yaml) for complete specification.
+See [openapi.yaml](./openapi.yaml) for the complete specification.
 
 ---
 
 ## 4. Validation
+
+### Malli Schemas
+
+All request and response validation is driven by [Malli](https://github.com/metosin/malli) schemas defined in `schema.clj`. Schema vars use **PascalCase** (`ProjectCreate`, `PaginationParams`) - this is the idiomatic Malli convention, mirroring how type/record names work in Clojure and visually distinguishing schema definitions from regular functions (which use `kebab-case`).
+
+| Schema | Role | Used in |
+|--------|------|---------|
+| `Project` | Full entity (closed map) | Response coercion for GET endpoints |
+| `ProjectCreate` | POST body (closed map) | Request coercion + handler validation |
+| `PaginationParams` | Query params for listing | Request coercion on GET /v1/projects |
+| `PaginatedResponse` | List response wrapper | Response coercion |
+| `ErrorResponse` | Error envelope | Response coercion on 400/404/409 |
+| `ProjectId` | UUID string (36 chars) | Path param coercion |
+| `ProjectName` | 1-200 char string | Reused in `Project` and `ProjectCreate` |
+| `ProjectStatus` | Enum: `active` / `on-hold` / `archived` | Reused in `Project` and `ProjectCreate` |
+
+Schemas are composed bottom-up: primitive schemas (`ProjectName`, `ProjectStatus`) are combined into domain schemas (`Project`, `ProjectCreate`), which are referenced in route definitions for automatic Reitit coercion. Closed maps (`:closed true`) reject unknown keys, preventing typos from silently passing through.
+
+A custom `string-transformer` chains Malli's built-in transformers with whitespace trimming, so `"  My Project  "` is coerced to `"My Project"` before validation.
+
+### How Coercion Works
+
+Schemas are enforced at two levels:
+
+1. **Reitit middleware (runtime)** - `coerce-request-middleware` and `coerce-response-middleware` automatically validate every incoming request and outgoing response against the schemas declared in route definitions. Invalid requests are rejected with 400 before reaching the handler; invalid responses surface as 500 errors, catching contract drift early.
+
+2. **Integration tests (build time)** - Every happy-path and error test asserts `(is (conforms? schema/Project body))` or `(is (conforms? schema/ErrorResponse body))`, validating that the actual API output matches the same Malli schemas used at runtime. This closes the loop: if a handler returns a field with the wrong type or omits a required key, the test suite catches it even without a running server.
+
+```clojure
+;; In api_test.clj - same schemas used in routes and tests
+(is (conforms? schema/Project body)          "response must match Project schema")
+(is (conforms? schema/PaginatedResponse body) "response must match PaginatedResponse schema")
+(is (conforms? schema/ErrorResponse body)     "error must match ErrorResponse schema")
+```
+
+This means the Malli schemas are the **single source of truth** - shared across route definitions, OpenAPI documentation, and test assertions.
 
 ### Input Validation Rules
 
@@ -146,11 +197,11 @@ See [openapi.yaml](./openapi.yaml) for complete specification.
 - `offset`: >= 0, defaults to 0
 - `sort`: `created_at`, `-created_at`, `name`, `-name`
 
-### Validation Enforcement
+### Validation Enforcement Layers
 
-1. **Reitit coercion middleware** — Validates path/query params
-2. **Malli schemas** — Validates request/response bodies
-3. **Database constraints** — CHECK constraints as safety net
+1. **Reitit coercion middleware** - Validates path/query params and request/response bodies
+2. **Malli schemas** - Single source of truth for all shapes
+3. **Database constraints** - CHECK constraints as safety net
 
 ---
 
@@ -160,48 +211,50 @@ See [openapi.yaml](./openapi.yaml) for complete specification.
 
 | Library | Purpose | Rationale |
 |---------|---------|-----------|
-| Ring + Jetty | HTTP server | Standard, battle-tested |
-| Reitit | Routing | Data-driven, Malli integration |
-| Malli | Validation | Required by spec, modern, fast |
-| next.jdbc | Database | Idiomatic, composable |
-| HikariCP | Connection pool | Industry standard, fast |
-| Integrant | Lifecycle | Simple, REPL-friendly |
+| Ring + Jetty | HTTP server | Standard, battle-tested, wide ecosystem |
+| Reitit | Routing | Data-driven, first-class Malli integration |
+| Malli | Validation | Required by spec, modern, composable, fast |
+| Muuntaja | Content negotiation | Pairs with Reitit, handles JSON encoding |
+| next.jdbc | Database | Idiomatic, composable, modern JDBC wrapper |
+| HikariCP | Connection pool | Industry standard, fast, handles validation |
+| Integrant | Lifecycle | Simple, REPL-friendly, declarative deps |
+| Kaocha | Test runner | Good reporting, extensible, Clojure-native |
 
-### Project Layout
+### Architecture
 
 ```
-├── src/projects/
-│   ├── config.clj      # Environment configuration
-│   ├── core.clj        # Entry point
-│   ├── db.clj          # Database layer
-│   ├── handlers.clj    # HTTP handlers
-│   ├── routes.clj      # Reitit routes
-│   ├── schema.clj      # Malli schemas
-│   └── system.clj      # Integrant lifecycle
-├── test/projects/
-│   ├── api_test.clj    # Integration tests
-│   └── schema_test.clj # Unit tests
-├── dev/user.clj        # REPL namespace
-├── migrations/         # SQL migrations
-├── terraform/          # Snowflake IaC
-├── openapi.yaml        # API specification
-└── DESIGN.md           # This document
+                 ┌───────────────────────────────────────┐
+  HTTP request → │ Ring + Reitit                         │
+                 │  ├─ content negotiation (Muuntaja)    │
+                 │  ├─ coercion (Malli schemas)          │
+                 │  └─ exception handling                │
+                 └──────────────┬────────────────────────┘
+                                │
+                 ┌──────────────▼────────────────────────┐
+                 │ Handlers (handlers.clj)               │
+                 │  └─ business logic + validation       │
+                 └──────────────┬────────────────────────┘
+                                │
+                 ┌──────────────▼────────────────────────┐
+                 │ Database (db.clj)                     │
+                 │  ├─ next.jdbc + HikariCP pool         │
+                 │  └─ SQLite (WAL mode)                 │
+                 └───────────────────────────────────────┘
 ```
 
 ### Stateful Component Management
 
-**Integrant** manages component lifecycle:
+**Integrant** manages component lifecycle with declarative dependency wiring:
 
 ```
-:db/pool      → Create HikariCP datasource
-    ↓
-:db/migrator  → Run migrations, seed data
-    ↓
-:http/server  → Start Jetty with Ring app
+:db/pool  →  :db/migrator  →  :http/server
+ (HikariCP)    (SQL + seed)     (Jetty)
 ```
 
-**Start order:** pool → migrator → server
-**Stop order:** server → migrator → pool (reverse)
+**Start order:** pool -> migrator -> server
+**Stop order:** server -> migrator -> pool (reverse)
+
+The REPL `(reset)` reloads code and restarts all components cleanly, providing fast development feedback without restarting the JVM.
 
 ### DB Connection Pooling
 
@@ -212,49 +265,57 @@ See [openapi.yaml](./openapi.yaml) for complete specification.
 
 **Why pool even for SQLite:**
 - Connection reuse avoids open/close overhead
-- Consistent pattern with production databases
-- HikariCP handles connection validation
+- Consistent pattern with production databases (Snowflake)
+- HikariCP handles connection health validation
 
 ### Testing Approach
 
-1. **Unit tests** (`schema_test.clj`) — Malli validation logic
-2. **Integration tests** (`api_test.clj`) — Full HTTP request cycle
-3. **In-memory SQLite** — Fresh database per test, fast, isolated
+1. **Unit tests** (`schema_test.clj`) - Malli validation logic in isolation
+2. **Integration tests** (`api_test.clj`) - Full HTTP request cycle through Ring mock
+3. **Schema coercion in tests** - Every response body validated against the same Malli schemas used at runtime
+4. **In-memory SQLite** - Fresh database per test, fast, isolated, no cleanup
+5. **Edge cases** - Unicode names, whitespace trimming, 409 conflict via `with-redefs`
 
 ### Security Considerations
 
 - Input validation prevents injection (Malli + parameterized queries)
 - No user-supplied data in SQL without parameterization
+- Closed Malli maps reject unknown keys
 - Status enum prevents invalid state transitions
 - UUIDs not guessable (vs sequential integers)
 
 ---
 
-## 6. Terraform Module
+## 6. Terraform Module (code-only)
 
 ### Resources Created
 
 | Resource | Purpose |
 |----------|---------|
-| `snowflake_database` | Dedicated database |
-| `snowflake_schema` | Schema for tables |
-| `snowflake_table` | Projects table |
+| `snowflake_database` | Dedicated database for Projects service |
+| `snowflake_schema` | Schema for organizing tables |
+| `snowflake_table` | Projects table matching the SQLite model |
 | `snowflake_role` | Service account role |
-| `snowflake_*_grant` | Appropriate permissions |
+| `snowflake_*_grant` | SELECT/INSERT/UPDATE permissions (no DELETE) |
 
 ### Variables
 
-- `database_name` — Snowflake database name
-- `schema_name` — Schema within database
-- `service_role_name` — Role for API service
-- `data_retention_days` — Time Travel setting
+- `database_name` - Snowflake database name (default: `PROJECTS_DB`)
+- `schema_name` - Schema within database (default: `PROJECTS`)
+- `service_role_name` - Role for API service (default: `PROJECTS_SERVICE_ROLE`)
+- `data_retention_days` - Time Travel setting (default: 7, range: 0-90)
+- `environment` - Environment tag: dev/staging/prod
 
 ### Review Surfaces
 
 Before applying:
-- Verify role permissions (SELECT/INSERT/UPDATE, no DELETE)
+- Verify role permissions (SELECT/INSERT/UPDATE, no DELETE by design)
 - Check Time Travel retention settings
-- Ensure naming conventions match standards
+- Ensure naming conventions match organizational standards
+
+```bash
+cd terraform && terraform init && terraform validate
+```
 
 ---
 
@@ -262,19 +323,22 @@ Before applying:
 
 This solution was developed with Claude Code assistance. Verification approach:
 
-1. **Schema validation** — Tested all Malli schemas with edge cases
-2. **API testing** — Comprehensive test suite covering happy paths and errors
-3. **Manual testing** — curl commands to verify behavior
-4. **Code review** — Read all generated code, understood each decision
-5. **Terraform validation** — `terraform validate` passes
+1. **Schema validation** - Tested all Malli schemas with edge cases in `schema_test.clj`
+2. **API testing** - 16 integration tests covering happy paths, validation errors, 404, and 409 conflict
+3. **Schema coercion in tests** - Every test asserts response bodies conform to Malli schemas, ensuring runtime and test-time contracts match
+4. **Manual testing** - curl commands to verify actual HTTP behavior end-to-end
+5. **Code review** - Read all generated code, understood each decision, fixed issues (e.g., Muuntaja encoding bug where manually set Content-Type headers prevented JSON serialization)
+6. **Terraform validation** - `terraform validate` passes
 
 ### Key Verifications Made
 
-- Confirmed Malli schema syntax for closed maps
-- Verified Reitit coercion middleware integration
-- Tested SQLite WAL mode configuration
-- Validated HikariCP settings for SQLite
-- Reviewed Terraform Snowflake provider resources
+- Confirmed Malli schema syntax for closed maps (`:closed true`)
+- Verified Reitit coercion middleware ordering (negotiate -> format-response -> exception -> format-request -> coerce)
+- Fixed Muuntaja integration: removed manual `Content-Type` headers from handlers that prevented JSON encoding
+- Fixed coercion error serialization: converted raw Malli error objects to JSON-safe `{:field :message}` maps
+- Tested SQLite WAL mode configuration for concurrent reads
+- Validated HikariCP settings for SQLite (small pool, init SQL for pragmas)
+- Reviewed Terraform Snowflake provider resources and grant permissions
 
 ---
 
@@ -288,13 +352,15 @@ This solution was developed with Claude Code assistance. Verification approach:
 ### Start the Server
 
 ```bash
-# Development mode with REPL
+# Run directly
+clj -M:run
+
+# Or development mode with REPL
 clj -M:dev
 # Then in REPL:
-(start)
-
-# Or run directly
-clj -M:run
+(start)   # boot the system
+(reset)   # reload code and restart
+(stop)    # shut down
 ```
 
 Server starts at http://localhost:3000
@@ -307,6 +373,7 @@ Server starts at http://localhost:3000
 | `DB_PATH` | projects.db | SQLite database file |
 | `DB_POOL_SIZE` | 5 | Connection pool size |
 | `DEFAULT_PAGE_SIZE` | 20 | Default pagination limit |
+| `MAX_PAGE_SIZE` | 100 | Maximum pagination limit |
 
 ### Run Tests
 
@@ -314,34 +381,10 @@ Server starts at http://localhost:3000
 # Run all tests
 clj -M:test
 
-# Or with verbose output
+# With verbose output
 clj -M:test --reporter documentation
-```
 
-### Example API Calls
-
-```bash
-# Health check
-curl http://localhost:3000/health
-
-# List projects
-curl http://localhost:3000/v1/projects
-
-# List with pagination
-curl "http://localhost:3000/v1/projects?limit=2&offset=0&sort=-created_at"
-
-# Get single project
-curl http://localhost:3000/v1/projects/550e8400-e29b-41d4-a716-446655440001
-
-# Create project
-curl -X POST http://localhost:3000/v1/projects \
-  -H "Content-Type: application/json" \
-  -d '{"name": "New Project"}'
-
-# Create with status
-curl -X POST http://localhost:3000/v1/projects \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Paused Project", "status": "on-hold"}'
+# 16 tests, 77 assertions, 0 failures
 ```
 
 ### Terraform Validation
